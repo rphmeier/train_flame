@@ -38,11 +38,6 @@ class RoPE2D(nn.Module):
         self.dim = dim
         self.base = base
         
-        # Compute frequencies for rotary embeddings
-        half_dim = dim // 2
-        freqs = base ** (torch.arange(0, half_dim, 2).float() / half_dim)
-        self.register_buffer('freqs', freqs)
-        
     def forward(self, x, H=20, W=20):
         """
         Apply 2D RoPE to input tensor.
@@ -50,6 +45,11 @@ class RoPE2D(nn.Module):
         """
         B, N, D = x.shape
         assert N == H * W, f"Number of patches {N} doesn't match H*W={H*W}"
+
+        # Compute frequencies for rotary embeddings
+        half_dim = self.dim // 2
+        freqs = self.base ** (torch.arange(0, half_dim, 2).float() / half_dim)
+        freqs = freqs.to(device=x.device, dtype=x.dtype)
         
         # Create 2D position grid normalized to [-1, 1]
         coords_h = torch.linspace(-1, 1, H, device=x.device)
@@ -59,7 +59,7 @@ class RoPE2D(nn.Module):
         
         # Compute angles for rotary embedding
         # Split dimensions for x and y coordinates
-        angles = coords[..., None] / self.freqs[None, None, :]  # [HW, 2, D//4]
+        angles = coords[..., None] / freqs[None, None, :]  # [HW, 2, D//4]
         angles = angles.flatten(-2)  # [HW, D//2]
         angles = 2 * math.pi * angles
         
@@ -294,30 +294,69 @@ def create_dataloaders(config):
     
     return train_loader, val_loader
 
+class MultiHeadAttention(nn.Module):
+    def __init__(self, dim=512, n_heads=8, rope_base=100.0):
+        super().__init__()
+
+        self.q = nn.Linear(dim, dim)
+        self.norm_q = nn.LayerNorm(dim)
+
+        self.k = nn.Linear(dim, dim)
+        self.v = nn.Linear(dim, dim)
+        self.o = nn.Linear(dim, dim)
+
+        self.norm_k = nn.LayerNorm(dim)
+
+        self.rope = RoPE2D(dim, rope_base)
+
+        self.dim = dim
+        self.n_heads = n_heads
+
+    def forward(self, x, context, grid_size_h, grid_size_w):
+        q = self.norm_q(self.q(x)) # [B, LQ, D]
+        k = self.norm_k(self.k(context)) # [B, LK, D]
+        v = self.v(context) # [B, LK, D]
+
+        k = self.rope(k, H=grid_size_h, W=grid_size_w)
+
+        I = torch.eye(self.dim, dtype=q.dtype, device=q.device)
+        x = torch.nn.functional.multi_head_attention_forward(
+            q.permute(1, 0, 2), # expects (L, B, E)
+            k.permute(1, 0, 2),
+            v.permute(1, 0, 2),
+            self.dim,
+            self.n_heads,
+            in_proj_weight=I.repeat(3, 1),
+            in_proj_bias=None,
+            bias_k=None,
+            bias_v=None,
+            add_zero_attn=False,
+            dropout_p=0.0,
+            out_proj_weight=I,
+            out_proj_bias=None,
+            training=self.training,
+        )
+
+        x = x.permute(1, 0, 2) # [L, B, D] -> [B, L, D]
+        return self.o(x)
+
+
 class TransformerDecoderBlock(nn.Module):
     """Single Transformer Decoder Block with self-attention and cross-attention."""
-    def __init__(self, d_model=512, n_heads=8, d_ff=2048):
+    def __init__(self, d_model=512, n_heads=8, d_ff=2048, rope_base=100.0):
         super().__init__()
         self.d_model = d_model
         self.n_heads = n_heads
         
         # Self-attention for queries
-        self.self_attention = nn.MultiheadAttention(
-            embed_dim=d_model,
-            num_heads=n_heads,
-            batch_first=True,
-            dropout=0
-        )
-        self.self_attn_norm = nn.LayerNorm(d_model)
+        self.self_attention = MultiHeadAttention(d_model, n_heads, rope_base)
         
         # Cross-attention: queries attend to patches
-        self.cross_attention = nn.MultiheadAttention(
-            embed_dim=d_model,
-            num_heads=n_heads,
-            batch_first=True,
-            dropout=0
-        )
-        self.cross_attn_norm = nn.LayerNorm(d_model)
+        self.cross_attention = MultiHeadAttention(d_model, n_heads, rope_base)
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
         
         # MLP
         self.ffn = nn.Sequential(
@@ -327,40 +366,24 @@ class TransformerDecoderBlock(nn.Module):
         )
         self.ffn_norm = nn.LayerNorm(d_model)
         
-    def forward(self, queries, keys, values, return_attention=False):
+    def forward(self, x, patch_tokens, grid_size_h, grid_size_w):
         """
         Args:
-            queries: [B, N_queries, d_model] - learnable parameter queries
-            keys: [B, N_patches, d_model] - patch features for cross-attention
-            values: [B, N_patches, d_model] - patch features for cross-attention
+            x: [B, N_queries, d_model] - landmark sequence
+            patch_tokens: [B, N_patches, d_model] - patch features for cross-attention
         Returns:
-            queries: [B, N_queries, d_model] - refined queries
+            x: [B, N_queries, d_model] - refined landmarks
         """
-        # Self-attention: queries attend to each other
-        queries_self, self_attn_weights = self.self_attention(
-            query=queries,
-            key=queries,
-            value=queries,
-            need_weights=return_attention
-        )
-        queries = self.self_attn_norm(queries + queries_self)
-        
-        # Cross-attention: queries attend to patches
-        queries_cross, cross_attn_weights = self.cross_attention(
-            query=queries,
-            key=keys,
-            value=values,
-            need_weights=return_attention
-        )
-        queries = self.cross_attn_norm(queries + queries_cross)
+
+        # Attend to patch tokens first
+        x = x + self.cross_attention(self.norm1(x), patch_tokens, grid_size_h, grid_size_w)
+
+        x = x + self.self_attention(self.norm2(x), x, grid_size_h, grid_size_w)
         
         # Feed-forward
-        queries_ffn = self.ffn(queries)
-        queries = self.ffn_norm(queries + queries_ffn)
+        x = x + self.ffn(self.norm3(x))
         
-        if return_attention:
-            return queries, (self_attn_weights, cross_attn_weights)
-        return queries
+        return x
 
 class FLAMEExpressionEncoder(nn.Module):
     """
@@ -393,21 +416,21 @@ class FLAMEExpressionEncoder(nn.Module):
                 param.requires_grad = False
             print("Using frozen DinoV3 backbone")
         
-        # Separate key and value projections: 1024 -> 512
-        self.k_proj = nn.Linear(backbone_dim, hidden_dim)
-        self.v_proj = nn.Linear(backbone_dim, hidden_dim)
-        
-        # RoPE for keys (relative positioning)
-        self.rope = RoPE2D(hidden_dim, base=rope_base)
-        
+        self.in_proj = nn.Linear(backbone_dim, hidden_dim)
+
         # Learnable expression queries - one per parameter
-        self.expression_queries = nn.Parameter(
+        self.x_base = nn.Parameter(
             torch.randn(num_expression_params, hidden_dim) * 0.02
         )
         
         # Transformer decoder blocks
         self.decoder_blocks = nn.ModuleList([
-            TransformerDecoderBlock(hidden_dim, num_heads, hidden_dim * 4)
+            TransformerDecoderBlock(
+                hidden_dim, 
+                num_heads, 
+                hidden_dim * 4, 
+                rope_base,
+            )
             for _ in range(num_decoder_blocks)
         ])
         
@@ -431,7 +454,7 @@ class FLAMEExpressionEncoder(nn.Module):
         self.to_params.weight.data.zero_()
         self.to_params.bias.data.zero_()
     
-    def forward(self, pixel_values, return_attention=False):
+    def forward(self, pixel_values):
         # Get DinoV3 features
         outputs = self.backbone(pixel_values=pixel_values, return_dict=True)
         hidden_states = outputs.last_hidden_state  # [B, 1 + num_register_tokens + num_patches, hidden_dim]
@@ -442,29 +465,16 @@ class FLAMEExpressionEncoder(nn.Module):
         patch_tokens = hidden_states[:, 1 + num_register_tokens:]  # [B, 400, 1024]
         
         # Project patches to hidden dimension
-        keys_proj = self.k_proj(patch_tokens)  # [B, 400, 512]
-        values_proj = self.v_proj(patch_tokens)  # [B, 400, 512]
-        
-        # Apply RoPE to keys
-        keys_rope = self.rope(keys_proj, H=self.grid_size, W=self.grid_size)  # [B, 400, 512]
-        
-        # Expand expression queries for batch
-        queries = self.expression_queries.unsqueeze(0).expand(B, -1, -1)  # [B, 55, 512]
+        patch_tokens = self.in_proj(patch_tokens) # [B, 400, 1024]
+        x = self.x_base.unsqueeze(0).expand(B, -1, -1) # [B, L, D]
         
         # Pass through decoder blocks
-        attention_weights = []
         for decoder_block in self.decoder_blocks:
-            if return_attention:
-                queries, attn_weights = decoder_block(queries, keys_rope, values_proj, return_attention=True)
-                attention_weights.append(attn_weights)
-            else:
-                queries = decoder_block(queries, keys_rope, values_proj)
+            x = decoder_block(x, patch_tokens, self.grid_size, self.grid_size)
         
         # Final projection to expression parameters
-        expression_params = self.to_params(queries).squeeze(-1)  # [B, 55]
+        expression_params = self.to_params(x).squeeze(-1)  # [B, 55]
         
-        if return_attention:
-            return expression_params, attention_weights
         return expression_params
 
 # Removed obsolete remapping functions - model now outputs 111 params directly
@@ -766,7 +776,7 @@ def train_model(config_path="config.yaml", restore_checkpoint=None):
         num_decoder_blocks=2,
         freeze_backbone=config.model.freeze_backbone,
         rope_base=100
-).to(device)
+    ).to(device)
     
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
